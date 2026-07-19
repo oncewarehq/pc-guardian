@@ -53,19 +53,29 @@ function Show-ThreatReport($since) {
     }
 }
 
+function Invoke-DefenderScan($scanType, $label) {
+    $start = Get-Date
+    try {
+        Start-MpScan -ScanType $scanType -ErrorAction Stop
+    } catch {
+        Write-Warn "The $label did NOT run - this is NOT an all-clear."
+        Write-Info "Windows Defender may be turned off, replaced by other security software,"
+        Write-Info "or blocked by tamper protection."
+        Write-Info "Details: $($_.Exception.Message)"
+        return
+    }
+    Show-ThreatReport $start
+}
+
 function Invoke-QuickScan {
     Write-Section "DEFENDER QUICK SCAN  (common malware locations, a few minutes)"
-    $start = Get-Date
-    Start-MpScan -ScanType QuickScan
-    Show-ThreatReport $start
+    Invoke-DefenderScan QuickScan "quick scan"
 }
 
 function Invoke-FullScan {
     Write-Section "DEFENDER FULL SCAN  (every file on disk, 30-90 minutes)"
     Write-Info "The PC stays usable while it runs. Go play something."
-    $start = Get-Date
-    Start-MpScan -ScanType FullScan
-    Show-ThreatReport $start
+    Invoke-DefenderScan FullScan "full scan"
 }
 
 function Invoke-Definitions {
@@ -140,7 +150,7 @@ function Invoke-DeepAudit {
 
     Write-Host ""
     Write-Host "  --- Traffic hijack checks ---" -ForegroundColor White
-    $hosts = Get-Content C:\Windows\System32\drivers\etc\hosts -ErrorAction SilentlyContinue |
+    $hosts = Get-Content "$env:SystemRoot\System32\drivers\etc\hosts" -ErrorAction SilentlyContinue |
              Where-Object { $_ -notmatch '^\s*#' -and $_.Trim() }
     if ($hosts) { $hosts | ForEach-Object { Write-Warn "hosts file entry: $_" } }
     else        { Write-Ok "hosts file is clean." }
@@ -187,19 +197,24 @@ function Invoke-DeepAudit {
 
     Write-Host ""
     Write-Host "  --- Is anything tampering with Defender? ---" -ForegroundColor White
-    $p = Get-MpPreference
-    if ($p.DisableRealtimeMonitoring) { Write-Warn "Real-time protection is OFF - turn it back on in Windows Security!" }
-    else                              { Write-Ok "Real-time protection on." }
-    if ($p.DisableBehaviorMonitoring) { Write-Warn "Behavior monitoring is OFF." } else { Write-Ok "Behavior monitoring on." }
-    if ($p.MAPSReporting -eq 0)       { Write-Warn "Cloud protection is OFF." }      else { Write-Ok "Cloud protection on." }
-    if ($p.PUAProtection -ne 1)       { Write-Warn "PUA/adware blocking is OFF." }   else { Write-Ok "PUA/adware blocking on." }
+    $p = $null
+    try { $p = Get-MpPreference -ErrorAction Stop } catch { }
+    if (-not $p) {
+        Write-Warn "Couldn't read Defender settings - it may be off or managed by another security product."
+    } else {
+        if ($p.DisableRealtimeMonitoring) { Write-Warn "Real-time protection is OFF - turn it back on in Windows Security!" }
+        else                              { Write-Ok "Real-time protection on." }
+        if ($p.DisableBehaviorMonitoring) { Write-Warn "Behavior monitoring is OFF." } else { Write-Ok "Behavior monitoring on." }
+        if ($p.MAPSReporting -eq 0)       { Write-Warn "Cloud protection is OFF." }      else { Write-Ok "Cloud protection on." }
+        if ($p.PUAProtection -ne 1)       { Write-Warn "PUA/adware blocking is OFF." }   else { Write-Ok "PUA/adware blocking on." }
+    }
 }
 
 # ---------------------------------------------------------------- cleanup
 
 function Invoke-Cleanup {
     Write-Section "JUNK CLEANUP  (temp files only - never your documents)"
-    $targets = @($env:TEMP, 'C:\Windows\Temp')
+    $targets = @($env:TEMP, "$env:SystemRoot\Temp")
     $freedTotal = 0
     foreach ($dir in $targets) {
         if (-not (Test-Path $dir)) { continue }
@@ -215,8 +230,9 @@ function Invoke-Cleanup {
         Write-Ok ("{0}: freed {1:N0} MB (files in use are kept)" -f $dir, ($freed / 1MB))
     }
     Write-Ok ("Total freed: {0:N0} MB" -f ($freedTotal / 1MB))
-    $drive = Get-PSDrive C
-    Write-Info ("C: drive now has {0:N1} GB free." -f ($drive.Free / 1GB))
+    $sysDriveLetter = $env:SystemDrive.TrimEnd(':')
+    $drive = Get-PSDrive $sysDriveLetter -ErrorAction SilentlyContinue
+    if ($drive) { Write-Info ("{0} drive now has {1:N1} GB free." -f $env:SystemDrive, ($drive.Free / 1GB)) }
 }
 
 # ---------------------------------------------------------------- drivers
@@ -264,32 +280,59 @@ function Invoke-DriverInstall {
     if ($go -ne 'y') { Write-Info "Nothing installed."; return }
 
     Write-Info "Creating a System Restore point first - your undo button..."
+    $haveRestorePoint = $false
     try {
         Checkpoint-Computer -Description "PC Guardian - before driver updates" -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
         Write-Ok "Restore point created."
+        $haveRestorePoint = $true
     } catch {
-        # Windows only allows one restore point per 24h by default; that earlier point still protects you.
-        Write-Warn "Restore point not created: $($_.Exception.Message)"
-        if ($AutoYes) { $go = 'y'; Write-Info "(An earlier restore point may still cover you.)" } else { $go = Read-Host "  Continue anyway? (y/n)" }
-        if ($go -ne 'y') { return }
+        Write-Warn "Couldn't create a restore point: $($_.Exception.Message)"
+        Write-Info "System Restore is often turned OFF by default on Windows Home. Trying to enable it..."
+        try {
+            Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction Stop
+            Checkpoint-Computer -Description "PC Guardian - before driver updates" -RestorePointType MODIFY_SETTINGS -ErrorAction Stop
+            Write-Ok "Turned on System Restore and created a restore point."
+            $haveRestorePoint = $true
+        } catch {
+            Write-Warn "Still couldn't create a restore point."
+        }
+    }
+    if (-not $haveRestorePoint) {
+        if ($AutoYes) {
+            Write-Warn "Skipping the driver install - there's no restore point to undo with, and we won't"
+            Write-Info "install drivers without one. Turn on System Restore (search 'Create a restore point'"
+            Write-Info "> Configure > Turn on), then try again - or update this driver from its maker's app."
+            return
+        } else {
+            $go = Read-Host "  No restore point available - install anyway? (y/n)"
+            if ($go -ne 'y') { return }
+        }
     }
 
-    $coll = New-Object -ComObject Microsoft.Update.UpdateColl
-    foreach ($u in $wu.Result.Updates) {
-        if (-not $u.EulaAccepted) { $u.AcceptEula() }
-        [void]$coll.Add($u)
+    try {
+        $coll = New-Object -ComObject Microsoft.Update.UpdateColl
+        foreach ($u in $wu.Result.Updates) {
+            if (-not $u.EulaAccepted) { $u.AcceptEula() }
+            [void]$coll.Add($u)
+        }
+        Write-Info "Downloading..."
+        $dl = $wu.Session.CreateUpdateDownloader()
+        $dl.Updates = $coll
+        [void]$dl.Download()
+        Write-Info "Installing..."
+        $inst = $wu.Session.CreateUpdateInstaller()
+        $inst.Updates = $coll
+        $res = $inst.Install()
+        switch ([int]$res.ResultCode) {
+            2 { Write-Ok "All drivers installed successfully." }
+            3 { Write-Warn "Finished, but at least one driver failed. Check Windows Update > Update history." }
+            default { Write-Warn "Driver install didn't complete (result code $($res.ResultCode)). Nothing was forced." }
+        }
+        if ($res.RebootRequired) { Write-Warn "Restart the PC to finish applying the drivers." }
+    } catch {
+        Write-Warn "Driver download/install failed: $($_.Exception.Message)"
+        Write-Info "If your internet dropped mid-download, reconnect and run this again."
     }
-    Write-Info "Downloading..."
-    $dl = $wu.Session.CreateUpdateDownloader()
-    $dl.Updates = $coll
-    [void]$dl.Download()
-    Write-Info "Installing..."
-    $inst = $wu.Session.CreateUpdateInstaller()
-    $inst.Updates = $coll
-    $res = $inst.Install()
-    if ($res.ResultCode -eq 2) { Write-Ok "All drivers installed successfully." }
-    else                       { Write-Warn "Finished with result code $($res.ResultCode) (2 = success, 3 = success but reboot pending)." }
-    if ($res.RebootRequired)   { Write-Warn "Restart the PC to finish applying drivers." }
 }
 
 # ---------------------------------------------------------------- menu / dispatch
