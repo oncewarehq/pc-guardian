@@ -20,6 +20,7 @@ namespace PCGuardian
         static readonly Color OKCOL  = Color.FromArgb(90, 220, 130);
         static readonly Color WARN   = Color.FromArgb(255, 200, 80);
         static readonly Color HEAD   = Color.FromArgb(90, 200, 250);
+        static readonly Color ERR    = Color.FromArgb(255, 110, 110);
 
         RichTextBox console;
         Label statusLabel;
@@ -27,6 +28,8 @@ namespace PCGuardian
         Button stopButton;
         Button[] taskButtons;
         Process current;
+        string currentTask;
+        bool closing;
         string scriptPath;
         float dpi = 1f;
 
@@ -161,7 +164,19 @@ namespace PCGuardian
             AppendLine("Rule of thumb for the Deep Audit: every line should be software", MUTED);
             AppendLine("you recognize. Anything unfamiliar? Ask Claude before deleting.", MUTED);
 
-            FormClosing += delegate { try { if (current != null && !current.HasExited) current.Kill(); } catch { } };
+            FormClosing += delegate(object s, FormClosingEventArgs e)
+            {
+                if (IsRunning() && currentTask == "driverinstall" &&
+                    MessageBox.Show("Drivers are still installing. Closing now could leave one half-installed.\r\n\r\nClose anyway?",
+                        "Install in progress", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+                {
+                    e.Cancel = true;
+                    return;
+                }
+                closing = true;
+                if (IsScanTask(currentTask) && IsRunning()) CancelDefenderScan();
+                try { if (IsRunning()) current.Kill(); } catch { }
+            };
 
             if (!File.Exists(scriptPath))
                 AppendLine("\r\nWARNING: PCGuardian.ps1 not found next to the app - keep them in the same folder.", WARN);
@@ -186,9 +201,42 @@ namespace PCGuardian
             return b;
         }
 
+        bool IsRunning() { return current != null && !current.HasExited; }
+
+        // Tasks whose real work is a Windows Defender scan running inside Defender's own service.
+        static bool IsScanTask(string task) { return task == "quick" || task == "full" || task == "all"; }
+
+        // Process events arrive on worker threads and can land after the window is gone.
+        void SafeInvoke(Action a)
+        {
+            if (closing || IsDisposed || !IsHandleCreated) return;
+            try { BeginInvoke(a); }
+            catch (InvalidOperationException) { }   // includes ObjectDisposedException
+        }
+
+        // Killing our PowerShell doesn't stop a scan - Defender's service keeps running it.
+        // Defender's own command-line tool can cancel it (needs admin, which this app has).
+        bool CancelDefenderScan()
+        {
+            string tool = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                                       @"Windows Defender\MpCmdRun.exe");
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo(tool, "-Scan -Cancel");
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                using (Process p = Process.Start(psi))
+                {
+                    if (!p.WaitForExit(15000)) return false;
+                    return p.ExitCode == 0;
+                }
+            }
+            catch { return false; }
+        }
+
         void RunTask(string task, string label)
         {
-            if (current != null && !current.HasExited) return;
+            if (IsRunning()) return;
 
             if (task == "driverinstall")
             {
@@ -208,6 +256,7 @@ namespace PCGuardian
             }
 
             AppendLine("", TEXT);
+            currentTask = task;
             SetBusy(true, label);
 
             ProcessStartInfo psi = new ProcessStartInfo();
@@ -218,32 +267,34 @@ namespace PCGuardian
             psi.RedirectStandardError = true;
             psi.CreateNoWindow = true;
 
-            current = new Process();
-            current.StartInfo = psi;
-            current.EnableRaisingEvents = true;
-            current.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
+            Process p = new Process();
+            p.StartInfo = psi;
+            p.EnableRaisingEvents = true;
+            p.OutputDataReceived += delegate(object s, DataReceivedEventArgs e)
             {
-                if (e.Data != null) BeginInvoke((Action)delegate { AppendColored(e.Data); });
+                if (e.Data != null) SafeInvoke(delegate { AppendColored(e.Data); });
             };
-            current.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
+            p.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e)
             {
                 if (e.Data != null && e.Data.Trim().Length > 0)
-                    BeginInvoke((Action)delegate { AppendLine(e.Data, WARN); });
+                    SafeInvoke(delegate { AppendLine("[ERROR] " + e.Data, ERR); });
             };
-            current.Exited += delegate
+            p.Exited += delegate
             {
-                BeginInvoke((Action)delegate
+                SafeInvoke(delegate
                 {
+                    if (p != current) return;   // a task the user already stopped
                     AppendLine("─── " + label + " finished ───", ACCENT);
                     SetBusy(false, null);
                 });
             };
+            current = p;
 
             try
             {
-                current.Start();
-                current.BeginOutputReadLine();
-                current.BeginErrorReadLine();
+                p.Start();
+                p.BeginOutputReadLine();
+                p.BeginErrorReadLine();
             }
             catch (Exception ex)
             {
@@ -254,7 +305,16 @@ namespace PCGuardian
 
         void StopTask()
         {
-            try { if (current != null && !current.HasExited) current.Kill(); } catch { }
+            if (!IsRunning()) return;
+            Process p = current;
+            current = null;   // its Exited event is now ignored
+            if (IsScanTask(currentTask))
+            {
+                if (CancelDefenderScan()) AppendLine("Windows Defender cancelled the scan.", WARN);
+                else AppendLine("Couldn't cancel Defender's scan - it may keep running in the background " +
+                                "(see Windows Security > Virus & threat protection).", WARN);
+            }
+            try { if (!p.HasExited) p.Kill(); } catch { }
             AppendLine("Task stopped by user.", WARN);
             SetBusy(false, null);
         }
@@ -262,7 +322,8 @@ namespace PCGuardian
         void SetBusy(bool busy, string label)
         {
             foreach (Button b in taskButtons) b.Enabled = !busy;
-            stopButton.Enabled = busy;
+            // A driver install can't be safely interrupted halfway, so it can't be stopped.
+            stopButton.Enabled = busy && currentTask != "driverinstall";
             statusDot.BackColor = busy ? WARN : OKCOL;
             statusLabel.Text = busy ? "Running: " + label + "…" : "Ready.";
         }

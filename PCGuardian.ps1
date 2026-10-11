@@ -56,7 +56,13 @@ function Show-ThreatReport($since) {
 function Invoke-DefenderScan($scanType, $label) {
     $start = Get-Date
     try {
-        Start-MpScan -ScanType $scanType -ErrorAction Stop
+        # Run as a job so we can print a heartbeat - otherwise a long scan looks frozen.
+        $job = Start-MpScan -ScanType $scanType -AsJob -ErrorAction Stop
+        while (-not (Wait-Job $job -Timeout 30)) {
+            Write-Info ("still scanning... {0:N0} min so far" -f ((Get-Date) - $start).TotalMinutes)
+        }
+        Receive-Job $job -ErrorAction Stop | Out-Null
+        Remove-Job $job
     } catch {
         Write-Warn "The $label did NOT run - this is NOT an all-clear."
         Write-Info "Windows Defender may be turned off, replaced by other security software,"
@@ -90,6 +96,33 @@ function Invoke-Definitions {
 
 # ---------------------------------------------------------------- deep audit
 
+# Display name for a browser extension. Never throws: a broken or half-written manifest
+# (common mid-update) is reported as unreadable instead of spilling errors into the audit.
+function Get-ExtensionName($manifest, $extensionId) {
+    try {
+        $m = Get-Content $manifest.FullName -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return "(unreadable manifest - id $extensionId)"
+    }
+    $name = $m.name
+    if ($name -like '__MSG_*') {
+        # Localized name: try the extension's own default language first, then English, then anything.
+        $key = $name -replace '^__MSG_|__$', ''
+        $locales = Join-Path $manifest.DirectoryName '_locales'
+        $candidates = @($m.default_locale, 'en', 'en_US', 'en_GB') | Where-Object { $_ } |
+                      ForEach-Object { Join-Path $locales "$_\messages.json" }
+        $candidates += @(Get-ChildItem $locales -Recurse -Filter messages.json -ErrorAction SilentlyContinue |
+                         ForEach-Object FullName)
+        $name = $null
+        foreach ($file in $candidates) {
+            if (-not (Test-Path $file)) { continue }
+            try { $name = (Get-Content $file -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop).$key.message } catch { }
+            if ($name) { break }
+        }
+    }
+    if ($name) { $name } else { "(unnamed - id $extensionId)" }
+}
+
 function Invoke-DeepAudit {
     Write-Section "DEEP AUDIT - persistence, botware, hijacks, trackers"
     Write-Info "Rule of thumb: every line should be software you recognize."
@@ -103,26 +136,30 @@ function Invoke-DeepAudit {
         'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run',
         'HKCU:\Software\Microsoft\Windows\CurrentVersion\RunOnce'
     )
+    $found = 0
     foreach ($key in $runKeys) {
         $props = Get-ItemProperty $key -ErrorAction SilentlyContinue
         if ($props) {
             $props.PSObject.Properties | Where-Object { $_.Name -notmatch '^PS' } | ForEach-Object {
-                Write-Info "$($_.Name)  =  $($_.Value)"
+                Write-Info "$($_.Name)  =  $($_.Value)"; $found++
             }
         }
     }
     Get-ChildItem "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup",
                   "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp" -ErrorAction SilentlyContinue |
-        ForEach-Object { Write-Info "Startup folder: $($_.Name)" }
+        Where-Object { $_.Name -ne 'desktop.ini' } |
+        ForEach-Object { Write-Info "Startup folder: $($_.Name)"; $found++ }
+    if ($found -eq 0) { Write-Ok "Nothing starts with Windows from the Run keys or Startup folders." }
 
     Write-Host ""
     Write-Host "  --- Non-Microsoft scheduled tasks ---" -ForegroundColor White
-    Get-ScheduledTask -ErrorAction SilentlyContinue |
-        Where-Object { $_.TaskPath -notlike '\Microsoft\*' -and $_.State -ne 'Disabled' } |
-        ForEach-Object {
-            $exe = ($_.Actions | ForEach-Object { $_.Execute }) -join ' '
-            Write-Info "$($_.TaskName)  ->  $exe"
-        }
+    $tasks = @(Get-ScheduledTask -ErrorAction SilentlyContinue |
+               Where-Object { $_.TaskPath -notlike '\Microsoft\*' -and $_.State -ne 'Disabled' })
+    foreach ($t in $tasks) {
+        $exe = ($t.Actions | ForEach-Object { $_.Execute }) -join ' '
+        Write-Info "$($t.TaskName)  ->  $exe"
+    }
+    if ($tasks.Count -eq 0) { Write-Ok "No non-Microsoft scheduled tasks." }
 
     Write-Host ""
     Write-Host "  --- Services running outside standard folders ---" -ForegroundColor White
@@ -134,19 +171,21 @@ function Invoke-DeepAudit {
 
     Write-Host ""
     Write-Host "  --- Processes running from AppData/ProgramData/Temp ---" -ForegroundColor White
-    Get-Process | Where-Object { $_.Path -and $_.Path -match 'AppData|ProgramData|\\Temp\\|Users\\Public' } |
-        Select-Object -Unique Name, Path | ForEach-Object { Write-Info "$($_.Name)  ->  $($_.Path)" }
+    $procs = @(Get-Process | Where-Object { $_.Path -and $_.Path -match 'AppData|ProgramData|\\Temp\\|Users\\Public' } |
+               Select-Object -Unique Name, Path)
+    $procs | ForEach-Object { Write-Info "$($_.Name)  ->  $($_.Path)" }
+    if ($procs.Count -eq 0) { Write-Ok "No programs running from AppData, ProgramData or Temp." }
 
     Write-Host ""
     Write-Host "  --- Who is talking to the internet right now ---" -ForegroundColor White
-    Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |
+    $talkers = @(Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |
         Where-Object { $_.RemoteAddress -notmatch '^(127\.|::1|fe80|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)' } |
         ForEach-Object {
             $p = Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue
             [PSCustomObject]@{ Name = $p.Name; Remote = "$($_.RemoteAddress):$($_.RemotePort)" }
-        } | Group-Object Name | Sort-Object Count -Descending | ForEach-Object {
-            Write-Info "$($_.Name): $($_.Count) connection(s)"
-        }
+        } | Group-Object Name | Sort-Object Count -Descending)
+    $talkers | ForEach-Object { Write-Info "$($_.Name): $($_.Count) connection(s)" }
+    if ($talkers.Count -eq 0) { Write-Ok "No open internet connections right now." }
 
     Write-Host ""
     Write-Host "  --- Traffic hijack checks ---" -ForegroundColor White
@@ -172,28 +211,20 @@ function Invoke-DeepAudit {
         @{ Browser = 'Edge';     Path = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Extensions" },
         @{ Browser = 'Chrome';   Path = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Extensions" }
     )
+    $extCount = 0
     foreach ($root in $extRoots) {
         if (Test-Path $root.Path) {
             Get-ChildItem $root.Path -Directory | ForEach-Object {
                 $manifest = Get-ChildItem $_.FullName -Recurse -Filter manifest.json -ErrorAction SilentlyContinue |
                             Select-Object -First 1
                 if ($manifest) {
-                    $m = Get-Content $manifest.FullName -Raw | ConvertFrom-Json
-                    $name = $m.name
-                    if ($name -like '__MSG_*') {
-                        $key = $name -replace '__MSG_|__', ''
-                        $loc = Get-ChildItem (Join-Path (Split-Path $manifest.FullName) '_locales\en*') -Filter messages.json -Recurse -ErrorAction SilentlyContinue |
-                               Select-Object -First 1
-                        if ($loc) {
-                            $msgs = Get-Content $loc.FullName -Raw | ConvertFrom-Json
-                            try { $name = $msgs.$key.message } catch { }
-                        }
-                    }
-                    Write-Info "$($root.Browser): $name"
+                    $extCount++
+                    Write-Info "$($root.Browser): $(Get-ExtensionName $manifest $_.Name)"
                 }
             }
         }
     }
+    if ($extCount -eq 0) { Write-Ok "No extensions found for Opera GX, Edge or Chrome (default profiles)." }
 
     Write-Host ""
     Write-Host "  --- Is anything tampering with Defender? ---" -ForegroundColor White
@@ -212,9 +243,25 @@ function Invoke-DeepAudit {
 
 # ---------------------------------------------------------------- cleanup
 
+# When a standard user approves the admin prompt with a *different* admin account, $env:TEMP
+# belongs to that admin. Returns the signed-in user's own Temp folder in that case, else $null.
+function Get-SignedInUserTemp {
+    try {
+        $consoleUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName
+        if (-not $consoleUser) { return $null }
+        $sid = (New-Object Security.Principal.NTAccount $consoleUser).Translate([Security.Principal.SecurityIdentifier]).Value
+        if ($sid -eq [Security.Principal.WindowsIdentity]::GetCurrent().User.Value) { return $null }
+        $profilePath = (Get-CimInstance Win32_UserProfile -Filter "SID='$sid'" -ErrorAction Stop).LocalPath
+        if ($profilePath) { return Join-Path $profilePath 'AppData\Local\Temp' }
+    } catch { }
+    return $null
+}
+
 function Invoke-Cleanup {
     Write-Section "JUNK CLEANUP  (temp files only - never your documents)"
     $targets = @($env:TEMP, "$env:SystemRoot\Temp")
+    $userTemp = Get-SignedInUserTemp
+    if ($userTemp) { $targets += $userTemp }
     $freedTotal = 0
     foreach ($dir in $targets) {
         if (-not (Test-Path $dir)) { continue }
