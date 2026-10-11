@@ -118,7 +118,11 @@ function Find-Button($win, $prefix) {
     throw "control '$prefix' not found"
 }
 function Click($btn) { [Native.User32]::PostMessage([IntPtr]$btn.Current.NativeWindowHandle, 0x00F5, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null }
-function Get-ConsoleText($win) { (Find-Button $win 'Welcome to PC Guardian').Current.Name }
+function Get-ConsoleText($win) {
+    ($win.FindAll([Windows.Automation.TreeScope]::Descendants, [Windows.Automation.Condition]::TrueCondition) |
+        ForEach-Object { $_.Current.Name }) -join "`n"
+}
+$StopLabel = [string][char]0x2715   # the Stop button's label starts with this mark
 
 # M11: stderr lines are labelled as errors, not as ordinary [CHECK] warnings
 $p = Start-Process $exe -PassThru
@@ -129,10 +133,10 @@ $consoleText = Get-ConsoleText $win
 Assert ($consoleText -match '\[ERROR\]\s*stub error line') "M11: engine errors are marked [ERROR]" "console: $($consoleText -replace '\s+',' ')"
 
 # Stale-exit race: Stop, then immediately start another task -> app must stay busy
-Click (Find-Button $win ([string][char]0x25A0))
+Click (Find-Button $win $StopLabel)
 Click (Find-Button $win 'Clean Junk')
 Start-Sleep -Seconds 2
-$audit = Find-Button $win 'Deep Audit'; $stop = Find-Button $win ([string][char]0x25A0)
+$audit = Find-Button $win 'Deep Audit'; $stop = Find-Button $win $StopLabel
 Assert ((-not $audit.Current.IsEnabled) -and $stop.Current.IsEnabled) "race: stopped task's exit doesn't un-busy the new task"
 $p.CloseMainWindow() | Out-Null; $p.WaitForExit(10000) | Out-Null
 if (-not $p.HasExited) { $p.Kill() }
